@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
+import math
+import threading
+from queue import Queue
+
+class WaypointManager(Node):
+    def __init__(self):
+        super().__init__('waypoint_manager')
+        
+        # Define waypoints in world coordinates
+        self.waypoints = {
+            'Home': (0.0, 0.0, 0.0),
+            'Station A': (2.0, 2.0, 0.0),
+            'Station B': (-2.0, 2.0, 0.0),
+            'Station C': (-2.0, -2.0, 0.0),
+            'Station D': (2.0, -2.0, 0.0),
+            'Docking Station': (0.0, 3.0, 0.0),
+        }
+        
+        self.home_pose = self.waypoints['Home']
+        self.current_waypoint_index = 0
+        self.waypoint_queue = Queue()
+        self.is_navigating = False
+        self.current_goal_handle = None
+        
+        # Create action client for Nav2
+        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        
+        # Publisher for status
+        self.status_pub = self.create_publisher(String, 'waypoint_status', 10)
+        
+        # Subscriber for waypoint commands from GUI
+        self.create_subscription(String, 'waypoint_command', self.waypoint_callback, 10)
+        
+        self.get_logger().info('Waypoint Manager initialized')
+        self.publish_status('Ready')
+    
+    def waypoint_callback(self, msg):
+        """Handle waypoint commands from GUI"""
+        command = msg.data
+        
+        if command.startswith('SINGLE:'):
+            waypoint_name = command.split(':', 1)[1]
+            self.get_logger().info(f'Single waypoint selected: {waypoint_name}')
+            self.waypoint_queue.queue.clear()
+            self.waypoint_queue.put(waypoint_name)
+            self.waypoint_queue.put('Home')
+            self.navigate_next()
+            
+        elif command.startswith('MULTI:'):
+            waypoints_str = command.split(':', 1)[1]
+            waypoint_names = waypoints_str.split(',')
+            self.get_logger().info(f'Multiple waypoints selected: {waypoint_names}')
+            self.waypoint_queue.queue.clear()
+            for wp in waypoint_names:
+                self.waypoint_queue.put(wp.strip())
+            self.waypoint_queue.put('Home')
+            self.navigate_next()
+            
+        elif command == 'CANCEL':
+            self.get_logger().info('Navigation cancelled')
+            self.cancel_navigation()
+    
+    def navigate_next(self):
+        """Navigate to the next waypoint in queue"""
+        if self.is_navigating:
+            self.get_logger().warn('Already navigating, skipping')
+            return
+        
+        if self.waypoint_queue.empty():
+            self.get_logger().info('All waypoints completed')
+            self.publish_status('Completed')
+            return
+        
+        waypoint_name = self.waypoint_queue.get()
+        
+        if waypoint_name not in self.waypoints:
+            self.get_logger().error(f'Unknown waypoint: {waypoint_name}')
+            self.navigate_next()
+            return
+        
+        self.is_navigating = True
+        self.publish_status(f'Navigating to {waypoint_name}')
+        self.get_logger().info(f'Navigating to {waypoint_name}')
+        
+        # Create goal
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = self.create_pose_stamped(waypoint_name)
+        
+        # Wait for action server
+        if not self.nav_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Navigation action server not available')
+            self.publish_status('Failed: Server unavailable')
+            self.is_navigating = False
+            self.navigate_next()
+            return
+        
+        # Send goal
+        self.send_goal_future = self.nav_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self.feedback_callback
+        )
+        self.send_goal_future.add_done_callback(self.goal_response_callback)
+    
+    def goal_response_callback(self, future):
+        """Handle goal response"""
+        goal_handle = future.result()
+        
+        if not goal_handle.accepted:
+            self.get_logger().error('Goal rejected')
+            self.publish_status('Failed: Goal rejected')
+            self.is_navigating = False
+            self.navigate_next()
+            return
+        
+        self.current_goal_handle = goal_handle
+        self.get_logger().info('Goal accepted')
+        
+        # Get result
+        self.result_future = goal_handle.get_result_async()
+        self.result_future.add_done_callback(self.result_callback)
+    
+    def feedback_callback(self, feedback_msg):
+        """Handle navigation feedback"""
+        feedback = feedback_msg.feedback
+        self.get_logger().debug(f'Feedback: {feedback}')
+    
+    def result_callback(self, future):
+        """Handle navigation result"""
+        result = future.result().result
+        
+        if result.result:
+            self.get_logger().info('Goal succeeded')
+            self.publish_status('Reached')
+        else:
+            self.get_logger().error('Goal failed')
+            self.publish_status('Failed')
+        
+        self.is_navigating = False
+        
+        # Navigate to next waypoint
+        threading.Timer(1.0, self.navigate_next).start()
+    
+    def cancel_navigation(self):
+        """Cancel current navigation"""
+        if self.current_goal_handle:
+            cancel_future = self.current_goal_handle.cancel_goal_async()
+            cancel_future.add_done_callback(self.cancel_callback)
+        
+        self.waypoint_queue.queue.clear()
+        self.is_navigating = False
+        self.publish_status('Cancelled')
+    
+    def cancel_callback(self, future):
+        """Handle cancel response"""
+        self.get_logger().info('Navigation cancelled')
+    
+    def create_pose_stamped(self, waypoint_name):
+        """Create a PoseStamped message for a waypoint"""
+        pose = PoseStamped()
+        pose.header.frame_id = 'map'
+        pose.header.stamp = self.get_clock().now().to_msg()
+        
+        x, y, yaw = self.waypoints[waypoint_name]
+        pose.pose.position.x = x
+        pose.pose.position.y = y
+        pose.pose.position.z = 0.0
+        
+        # Convert yaw to quaternion
+        pose.pose.orientation.x = 0.0
+        pose.pose.orientation.y = 0.0
+        pose.pose.orientation.z = math.sin(yaw / 2.0)
+        pose.pose.orientation.w = math.cos(yaw / 2.0)
+        
+        return pose
+    
+    def publish_status(self, status):
+        """Publish navigation status"""
+        msg = String()
+        msg.data = status
+        self.status_pub.publish(msg)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = WaypointManager()
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
